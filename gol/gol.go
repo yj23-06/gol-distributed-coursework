@@ -177,7 +177,7 @@ func startEmbeddedServer() {
 	serverOnce.Do(func() {
 		engine := new(GolEngine)
 		_ = rpc.Register(engine)
-		listener, err := net.Listen("tcp", "34.201.167.52")
+		listener, err := net.Listen("tcp", "127.0.0.1:8030")
 		if err == nil {
 			go func() {
 				for {
