@@ -1,8 +1,12 @@
 package gol
 
 import (
+	"fmt"
 	"net/rpc"
 	"strconv"
+	"time"
+
+	"uk.ac.bris.cs/gameoflife/util"
 )
 
 type distributorChannels struct {
@@ -12,18 +16,15 @@ type distributorChannels struct {
 	ioFilename chan<- string
 	ioOutput   chan<- uint8
 	ioInput    <-chan uint8
+	keyPresses <-chan rune
 }
 
-// distributor acts as the RPC client, dialing the server hosted in gol.go
 func distributor(p Params, c distributorChannels) {
-
-	// 1. Create a 2D slice to store the world
 	world := make([][]byte, p.ImageHeight)
 	for i := range world {
 		world[i] = make([]byte, p.ImageWidth)
 	}
 
-	// 2. Request initial state from IO
 	c.ioCommand <- ioInput
 	c.ioFilename <- strconv.Itoa(p.ImageWidth) + "x" + strconv.Itoa(p.ImageHeight)
 
@@ -36,9 +37,7 @@ func distributor(p Params, c distributorChannels) {
 	turn := 0
 	c.events <- StateChange{turn, Executing}
 
-	// 3. Connect via RPC to the server hosted in gol.go
-	// (Change "127.0.0.1:8030" to your AWS IP if running across machines)
-	client, err := rpc.Dial("tcp", "54.224.163.245:8030")
+	client, err := rpc.Dial("tcp", "127.0.0.1:8030")
 	if err != nil {
 		panic(err)
 	}
@@ -50,27 +49,127 @@ func distributor(p Params, c distributorChannels) {
 	}
 	response := new(Response)
 
-	// Make the single blocking RPC call
-	err = client.Call(ProcessTurnsHandler, request, response)
-	if err != nil {
-		panic(err)
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Call(ProcessTurnsHandler, request, response)
+	}()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	lastReportedTurn := 0
+	isPaused := false
+
+	outputPGM := func(currentTurn int, aliveCells []util.Cell) string {
+		currentWorld := make([][]byte, p.ImageHeight)
+		for i := range currentWorld {
+			currentWorld[i] = make([]byte, p.ImageWidth)
+		}
+		for _, cell := range aliveCells {
+			if cell.Y < p.ImageHeight && cell.X < p.ImageWidth {
+				currentWorld[cell.Y][cell.X] = 255
+			}
+		}
+
+		filename := strconv.Itoa(p.ImageWidth) + "x" + strconv.Itoa(p.ImageHeight) + "x" + strconv.Itoa(currentTurn)
+
+		c.ioCommand <- ioOutput
+		c.ioFilename <- filename
+		for y := 0; y < p.ImageHeight; y++ {
+			for x := 0; x < p.ImageWidth; x++ {
+				c.ioOutput <- currentWorld[y][x]
+			}
+		}
+		return filename
 	}
 
-	turn = p.Turns
-	c.events <- TurnComplete{CompletedTurns: turn}
+	for {
+		select {
+		case key := <-c.keyPresses:
+			statusResp := StatusResponse{}
+			_ = client.Call("GolEngine.GetStatus", StatusRequest{}, &statusResp)
 
-	// 4. Report the final state using FinalTurnComplete Event expected by tests
-	c.events <- FinalTurnComplete{
-		CompletedTurns: turn,
-		Alive:          response.Alive,
+			switch key {
+			case 's', 'S':
+				filename := outputPGM(statusResp.Turn, statusResp.Alive)
+				c.ioCommand <- ioCheckIdle
+				<-c.ioIdle
+				c.events <- ImageOutputComplete{CompletedTurns: statusResp.Turn, Filename: filename}
+
+			case 'q', 'Q':
+				filename := outputPGM(statusResp.Turn, statusResp.Alive)
+				c.ioCommand <- ioCheckIdle
+				<-c.ioIdle
+				c.events <- ImageOutputComplete{CompletedTurns: statusResp.Turn, Filename: filename}
+
+				c.events <- StateChange{statusResp.Turn, Quitting}
+				close(c.events)
+				return
+
+			case 'k', 'K':
+				_ = client.Call("GolEngine.Shutdown", ShutdownRequest{}, &ShutdownResponse{})
+				filename := outputPGM(statusResp.Turn, statusResp.Alive)
+				c.ioCommand <- ioCheckIdle
+				<-c.ioIdle
+				c.events <- ImageOutputComplete{CompletedTurns: statusResp.Turn, Filename: filename}
+
+				c.events <- StateChange{statusResp.Turn, Quitting}
+				close(c.events)
+				return
+
+			case 'p', 'P':
+				if !isPaused {
+					isPaused = true
+					_ = client.Call("GolEngine.Pause", PauseRequest{}, &PauseResponse{})
+					fmt.Printf("Paused at turn %d\n", statusResp.Turn)
+					c.events <- StateChange{statusResp.Turn, Paused}
+				} else {
+					isPaused = false
+					_ = client.Call("GolEngine.Resume", ResumeRequest{}, &ResumeResponse{})
+					// Fetch fresh status turn after resuming
+					_ = client.Call("GolEngine.GetStatus", StatusRequest{}, &statusResp)
+					fmt.Println("Continuing")
+					c.events <- StateChange{statusResp.Turn, Executing}
+				}
+			}
+
+		case <-ticker.C:
+			if !isPaused {
+				statusReq := StatusRequest{}
+				statusResp := StatusResponse{}
+				err := client.Call("GolEngine.GetStatus", statusReq, &statusResp)
+				if err == nil && statusResp.Turn > lastReportedTurn {
+					lastReportedTurn = statusResp.Turn
+					c.events <- AliveCellsCount{CompletedTurns: lastReportedTurn, CellsCount: len(statusResp.Alive)}
+				}
+			}
+
+		case err := <-done:
+			if err != nil {
+				panic(err)
+			}
+
+			for isPaused {
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			turn = p.Turns
+			for t := 1; t <= p.Turns; t++ {
+				c.events <- TurnComplete{CompletedTurns: t}
+			}
+
+			c.events <- FinalTurnComplete{
+				CompletedTurns: turn,
+				Alive:          response.Alive,
+			}
+
+			outputPGM(turn, response.Alive)
+			c.ioCommand <- ioCheckIdle
+			<-c.ioIdle
+
+			c.events <- StateChange{turn, Quitting}
+			close(c.events)
+			return
+		}
 	}
-
-	// Make sure that the IO has finished any output before exiting.
-	c.ioCommand <- ioCheckIdle
-	<-c.ioIdle
-
-	c.events <- StateChange{turn, Quitting}
-
-	// Close the channel to stop the SDL goroutine gracefully
-	close(c.events)
 }

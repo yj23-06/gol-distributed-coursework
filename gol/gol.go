@@ -1,15 +1,14 @@
 package gol
 
 import (
-	"errors"
 	"net"
 	"net/rpc"
 	"sync"
+	"time"
 
 	"uk.ac.bris.cs/gameoflife/util"
 )
 
-// ProcessTurnsHandler defines the RPC method path
 var ProcessTurnsHandler = "GolEngine.ProcessTurns"
 
 type Request struct {
@@ -21,19 +20,56 @@ type Response struct {
 	Alive []util.Cell
 }
 
-// GolEngine acts as the server-side RPC receiver
-type GolEngine struct{}
+type StatusRequest struct{}
+
+type StatusResponse struct {
+	Turn  int
+	Alive []util.Cell
+}
+
+type PauseRequest struct{}
+type PauseResponse struct{}
+
+type ResumeRequest struct{}
+type ResumeResponse struct{}
+
+type ShutdownRequest struct{}
+type ShutdownResponse struct{}
+
+// GolEngine acts as the server-side RPC receiver with thread-safe control & progress tracking
+type GolEngine struct {
+	mu           sync.Mutex
+	currentTurn  int
+	currentAlive []util.Cell
+	paused       bool
+	shutdown     bool
+}
 
 func (g *GolEngine) ProcessTurns(req Request, res *Response) error {
-	if req.Params.Turns <= 0 {
-		return errors.New("a number of turns must be specified")
-	}
+	// Reset engine state at the start of every request to prevent cross-test contamination
+	g.mu.Lock()
+	g.paused = false
+	g.shutdown = false
+	g.currentTurn = 0
+	g.currentAlive = nil
+	g.mu.Unlock()
 
 	world := req.Board
 	p := req.Params
 
-	// Run Game of Life generations on the server side
 	for turn := 0; turn < p.Turns; turn++ {
+		g.mu.Lock()
+		for g.paused && !g.shutdown {
+			g.mu.Unlock()
+			time.Sleep(50 * time.Millisecond)
+			g.mu.Lock()
+		}
+		if g.shutdown {
+			g.mu.Unlock()
+			return nil
+		}
+		g.mu.Unlock()
+
 		newWorld := make([][]byte, p.ImageHeight)
 		for i := range newWorld {
 			newWorld[i] = make([]byte, p.ImageWidth)
@@ -71,9 +107,22 @@ func (g *GolEngine) ProcessTurns(req Request, res *Response) error {
 			}
 		}
 		world = newWorld
+
+		var alive []util.Cell
+		for y := 0; y < p.ImageHeight; y++ {
+			for x := 0; x < p.ImageWidth; x++ {
+				if world[y][x] == 255 {
+					alive = append(alive, util.Cell{X: x, Y: y})
+				}
+			}
+		}
+
+		g.mu.Lock()
+		g.currentTurn = turn + 1
+		g.currentAlive = alive
+		g.mu.Unlock()
 	}
 
-	// Gather final alive cells
 	var finalAlive []util.Cell
 	for y := 0; y < p.ImageHeight; y++ {
 		for x := 0; x < p.ImageWidth; x++ {
@@ -83,18 +132,52 @@ func (g *GolEngine) ProcessTurns(req Request, res *Response) error {
 		}
 	}
 
+	g.mu.Lock()
+	g.currentTurn = p.Turns
+	g.currentAlive = finalAlive
+	g.mu.Unlock()
+
 	res.Alive = finalAlive
 	return nil
 }
 
-// Ensures the embedded RPC server listener starts only once
+func (g *GolEngine) GetStatus(req StatusRequest, res *StatusResponse) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	res.Turn = g.currentTurn
+	res.Alive = g.currentAlive
+	return nil
+}
+
+func (g *GolEngine) Pause(req PauseRequest, res *PauseResponse) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.paused = true
+	return nil
+}
+
+func (g *GolEngine) Resume(req ResumeRequest, res *ResumeResponse) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.paused = false
+	return nil
+}
+
+func (g *GolEngine) Shutdown(req ShutdownRequest, res *ShutdownResponse) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.shutdown = true
+	g.paused = false
+	return nil
+}
+
 var serverOnce sync.Once
 
 func startEmbeddedServer() {
 	serverOnce.Do(func() {
 		engine := new(GolEngine)
 		_ = rpc.Register(engine)
-		listener, err := net.Listen("tcp", ":8030")
+		listener, err := net.Listen("tcp", "127.0.0.1:8030")
 		if err == nil {
 			go func() {
 				for {
@@ -109,7 +192,6 @@ func startEmbeddedServer() {
 	})
 }
 
-// Params provides the details of how to run the Game of Life and which image to load.
 type Params struct {
 	Turns       int
 	Threads     int
@@ -117,9 +199,7 @@ type Params struct {
 	ImageHeight int
 }
 
-// Run starts the processing of Game of Life. It initialises channels and goroutines.
 func Run(p Params, events chan<- Event, keyPresses <-chan rune) {
-	// Spin up the server listener automatically when Run is called
 	startEmbeddedServer()
 
 	ioCommand := make(chan ioCommand)
@@ -144,6 +224,7 @@ func Run(p Params, events chan<- Event, keyPresses <-chan rune) {
 		ioFilename: ioFilename,
 		ioOutput:   ioOutput,
 		ioInput:    ioInput,
+		keyPresses: keyPresses,
 	}
 	distributor(p, distributorChannels)
 }
