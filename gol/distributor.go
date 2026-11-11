@@ -37,7 +37,7 @@ func distributor(p Params, c distributorChannels) {
 	turn := 0
 	c.events <- StateChange{turn, Executing}
 
-	client, err := rpc.Dial("tcp", "52.202.55.78")
+	client, err := rpc.Dial("tcp", "52.202.55.78:8030")
 	if err != nil {
 		panic(err)
 	}
