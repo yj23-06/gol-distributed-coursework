@@ -24,6 +24,7 @@ type WorkerRequest struct {
 type WorkerResponse struct {
 	UpdatedRows [][]byte
 	Alive       []util.Cell
+	Flipped     []util.Cell
 }
 
 type BrokerServer struct {
@@ -33,18 +34,53 @@ type BrokerServer struct {
 	currentAlive []util.Cell
 	paused       bool
 	shutdown     bool
+	updates      *gol.UpdateHub
+	updatesMu    sync.Mutex
 }
 
-// ProcessTurns receives the full board from the local controller, slices it,
-// coordinates turns across AWS workers, handles broker-mediated ghost-row exchange,
-// and returns the final alive cells.
-func (b *BrokerServer) ProcessTurns(req gol.Request, res *gol.Response) error {
+func (b *BrokerServer) updateHub() *gol.UpdateHub {
+	b.updatesMu.Lock()
+	defer b.updatesMu.Unlock()
+	if b.updates == nil {
+		b.updates = gol.NewUpdateHub()
+	}
+	return b.updates
+}
+
+func (b *BrokerServer) StartUpdates(req gol.StartUpdatesRequest, res *gol.StartUpdatesResponse) error {
+	if err := b.updateHub().Start(req.RunID); err != nil {
+		return err
+	}
 	b.mu.Lock()
 	b.paused = false
 	b.shutdown = false
 	b.currentTurn = 0
 	b.currentAlive = nil
 	b.mu.Unlock()
+	return nil
+}
+
+func (b *BrokerServer) NextUpdate(req gol.NextUpdateRequest, res *gol.NextUpdateResponse) error {
+	update, done, err := b.updateHub().Next(req.RunID)
+	if err != nil {
+		return err
+	}
+	res.Update = update
+	res.Done = done
+	return nil
+}
+
+func (b *BrokerServer) StopUpdates(req gol.StopUpdatesRequest, res *gol.StopUpdatesResponse) error {
+	b.updateHub().Stop(req.RunID)
+	return nil
+}
+
+// ProcessTurns receives the full board from the local controller, slices it,
+// coordinates turns across AWS workers, handles broker-mediated ghost-row exchange,
+// and returns the final alive cells.
+func (b *BrokerServer) ProcessTurns(req gol.Request, res *gol.Response) error {
+	hub := b.updateHub()
+	defer hub.Complete(req.RunID)
 
 	p := req.Params
 	board := req.Board
@@ -69,6 +105,7 @@ func (b *BrokerServer) ProcessTurns(req gol.Request, res *gol.Response) error {
 		var wg sync.WaitGroup
 		updatedStrips := make([][][]byte, numWorkers)
 		workerAliveCells := make([][]util.Cell, numWorkers)
+		workerFlippedCells := make([][]util.Cell, numWorkers)
 		errs := make([]error, numWorkers)
 
 		// Dispatch horizontal strips to each AWS worker concurrently
@@ -127,6 +164,7 @@ func (b *BrokerServer) ProcessTurns(req gol.Request, res *gol.Response) error {
 
 				updatedStrips[workerIdx] = wRes.UpdatedRows
 				workerAliveCells[workerIdx] = wRes.Alive
+				workerFlippedCells[workerIdx] = wRes.Flipped
 			}(i)
 		}
 		wg.Wait()
@@ -141,12 +179,14 @@ func (b *BrokerServer) ProcessTurns(req gol.Request, res *gol.Response) error {
 		// Reassemble the global board and compile alive cells for the next turn
 		newBoard := make([][]byte, height)
 		var allAlive []util.Cell
+		var allFlipped []util.Cell
 		for i := 0; i < numWorkers; i++ {
 			startY := i * rowsPerWorker
 			for r, row := range updatedStrips[i] {
 				newBoard[startY+r] = row
 			}
 			allAlive = append(allAlive, workerAliveCells[i]...)
+			allFlipped = append(allFlipped, workerFlippedCells[i]...)
 		}
 		board = newBoard
 
@@ -155,6 +195,13 @@ func (b *BrokerServer) ProcessTurns(req gol.Request, res *gol.Response) error {
 		b.currentTurn = turn + 1
 		b.currentAlive = allAlive
 		b.mu.Unlock()
+
+		if err := hub.Publish(req.RunID, gol.TurnUpdate{
+			CompletedTurns: turn + 1,
+			Flipped:        allFlipped,
+		}); err != nil {
+			return err
+		}
 	}
 
 	res.Alive = b.currentAlive
@@ -198,13 +245,13 @@ func main() {
 	// Configure your AWS EC2 instance IP addresses here
 	broker := &BrokerServer{
 		workerAddrs: []string{
-			"52.90.223.57:8030",
-			"34.230.34.138:8030",
+			"54.156.62.118:8030",
+			"23.23.46.79:8030",
 			// Replace / add your AWS worker node IPs here
 		},
 	}
 
-	if err := rpc.Register(broker); err != nil {
+	if err := rpc.RegisterName("GolEngine", broker); err != nil {
 		log.Fatalf("Failed to register broker: %v", err)
 	}
 

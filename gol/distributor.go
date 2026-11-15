@@ -3,11 +3,21 @@ package gol
 import (
 	"fmt"
 	"net/rpc"
+	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"uk.ac.bris.cs/gameoflife/util"
 )
+
+type updateResult struct {
+	update TurnUpdate
+	done   bool
+	err    error
+}
+
+var runSequence uint64
 
 type distributorChannels struct {
 	events     chan<- Event
@@ -35,17 +45,43 @@ func distributor(p Params, c distributorChannels) {
 	}
 
 	turn := 0
-	c.events <- StateChange{turn, Executing}
+	initialAlive := make([]util.Cell, 0)
+	for y, row := range world {
+		for x, value := range row {
+			if value == 255 {
+				initialAlive = append(initialAlive, util.Cell{X: x, Y: y})
+			}
+		}
+	}
+	if len(initialAlive) > 0 {
+		c.events <- CellsFlipped{CompletedTurns: turn, Cells: initialAlive}
+	}
 
-	client, err := rpc.Dial("tcp", "127.0.0.1:8030")
+	address := brokerAddress()
+	if address == "" {
+		address = "127.0.0.1:8030"
+	}
+	client, err := rpc.Dial("tcp", address)
 	if err != nil {
 		panic(err)
 	}
 	defer client.Close()
 
+	runID := fmt.Sprintf("%d-%d", os.Getpid(), atomic.AddUint64(&runSequence, 1))
+	if err := client.Call("GolEngine.StartUpdates", StartUpdatesRequest{RunID: runID}, &StartUpdatesResponse{}); err != nil {
+		panic(err)
+	}
+	c.events <- StateChange{turn, Executing}
+	stopUpdates := make(chan struct{})
+	defer func() {
+		close(stopUpdates)
+		_ = client.Call("GolEngine.StopUpdates", StopUpdatesRequest{RunID: runID}, &StopUpdatesResponse{})
+	}()
+
 	request := Request{
 		Params: p,
 		Board:  world,
+		RunID:  runID,
 	}
 	response := new(Response)
 
@@ -54,11 +90,39 @@ func distributor(p Params, c distributorChannels) {
 		done <- client.Call(ProcessTurnsHandler, request, response)
 	}()
 
+	updates := make(chan updateResult)
+	go func() {
+		for {
+			var result updateResult
+			response := NextUpdateResponse{}
+			if err := client.Call("GolEngine.NextUpdate", NextUpdateRequest{RunID: runID}, &response); err != nil {
+				result.err = err
+				select {
+				case updates <- result:
+				case <-stopUpdates:
+				}
+				return
+			}
+			result.update = response.Update
+			result.done = response.Done
+			select {
+			case updates <- result:
+			case <-stopUpdates:
+				return
+			}
+			if response.Done {
+				return
+			}
+		}
+	}()
+
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	lastReportedTurn := 0
 	isPaused := false
+	processFinished := false
+	updatesFinished := false
 
 	outputPGM := func(currentTurn int, aliveCells []util.Cell) string {
 		currentWorld := make([][]byte, p.ImageHeight)
@@ -144,20 +208,35 @@ func distributor(p Params, c distributorChannels) {
 				}
 			}
 
+		case result := <-updates:
+			if result.err != nil {
+				panic(result.err)
+			}
+			if result.done {
+				updatesFinished = true
+				continue
+			}
+			update := result.update
+			if len(update.Flipped) > 0 {
+				c.events <- CellsFlipped{
+					CompletedTurns: update.CompletedTurns,
+					Cells:          update.Flipped,
+				}
+			}
+			c.events <- TurnComplete{CompletedTurns: update.CompletedTurns}
+
 		case err := <-done:
 			if err != nil {
 				panic(err)
 			}
+			processFinished = true
+		}
 
+		if processFinished && updatesFinished {
 			for isPaused {
 				time.Sleep(100 * time.Millisecond)
 			}
-
 			turn = p.Turns
-			for t := 1; t <= p.Turns; t++ {
-				c.events <- TurnComplete{CompletedTurns: t}
-			}
-
 			c.events <- FinalTurnComplete{
 				CompletedTurns: turn,
 				Alive:          response.Alive,

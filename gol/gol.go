@@ -1,8 +1,10 @@
 package gol
 
 import (
+	"errors"
 	"net"
 	"net/rpc"
+	"os"
 	"sync"
 	"time"
 
@@ -14,11 +16,38 @@ var ProcessTurnsHandler = "GolEngine.ProcessTurns"
 type Request struct {
 	Params Params
 	Board  [][]byte
+	RunID  string
 }
 
 type Response struct {
 	Alive []util.Cell
 }
+
+type TurnUpdate struct {
+	CompletedTurns int
+	Flipped        []util.Cell
+}
+
+type StartUpdatesRequest struct {
+	RunID string
+}
+
+type StartUpdatesResponse struct{}
+
+type NextUpdateRequest struct {
+	RunID string
+}
+
+type NextUpdateResponse struct {
+	Update TurnUpdate
+	Done   bool
+}
+
+type StopUpdatesRequest struct {
+	RunID string
+}
+
+type StopUpdatesResponse struct{}
 
 type StatusRequest struct{}
 
@@ -36,6 +65,97 @@ type ResumeResponse struct{}
 type ShutdownRequest struct{}
 type ShutdownResponse struct{}
 
+type updateStream struct {
+	updates   chan TurnUpdate
+	done      chan struct{}
+	cancel    chan struct{}
+	completed bool
+}
+
+type UpdateHub struct {
+	mu      sync.Mutex
+	streams map[string]*updateStream
+}
+
+func NewUpdateHub() *UpdateHub {
+	return &UpdateHub{streams: make(map[string]*updateStream)}
+}
+
+func (h *UpdateHub) Start(runID string) error {
+	if runID == "" {
+		return errors.New("empty update stream run ID")
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, exists := h.streams[runID]; exists {
+		return errors.New("update stream already exists")
+	}
+	h.streams[runID] = &updateStream{
+		updates: make(chan TurnUpdate),
+		done:    make(chan struct{}),
+		cancel:  make(chan struct{}),
+	}
+	return nil
+}
+
+func (h *UpdateHub) Publish(runID string, update TurnUpdate) error {
+	if runID == "" {
+		return nil
+	}
+	h.mu.Lock()
+	stream := h.streams[runID]
+	h.mu.Unlock()
+	if stream == nil {
+		return errors.New("update stream not found")
+	}
+	select {
+	case stream.updates <- update:
+		return nil
+	case <-stream.cancel:
+		return nil
+	case <-stream.done:
+		return errors.New("cannot publish to completed update stream")
+	}
+}
+
+func (h *UpdateHub) Next(runID string) (TurnUpdate, bool, error) {
+	h.mu.Lock()
+	stream := h.streams[runID]
+	h.mu.Unlock()
+	if stream == nil {
+		return TurnUpdate{}, false, errors.New("update stream not found")
+	}
+	select {
+	case update := <-stream.updates:
+		return update, false, nil
+	case <-stream.done:
+		return TurnUpdate{}, true, nil
+	case <-stream.cancel:
+		return TurnUpdate{}, true, nil
+	}
+}
+
+func (h *UpdateHub) Complete(runID string) {
+	if runID == "" {
+		return
+	}
+	h.mu.Lock()
+	if stream := h.streams[runID]; stream != nil && !stream.completed {
+		stream.completed = true
+		close(stream.done)
+	}
+	h.mu.Unlock()
+}
+
+func (h *UpdateHub) Stop(runID string) {
+	h.mu.Lock()
+	if stream := h.streams[runID]; stream != nil {
+		delete(h.streams, runID)
+		close(stream.cancel)
+	}
+	h.mu.Unlock()
+}
+
 // GolEngine acts as the server-side RPC receiver with thread-safe control & progress tracking
 type GolEngine struct {
 	mu           sync.Mutex
@@ -43,16 +163,49 @@ type GolEngine struct {
 	currentAlive []util.Cell
 	paused       bool
 	shutdown     bool
+	updates      *UpdateHub
 }
 
-func (g *GolEngine) ProcessTurns(req Request, res *Response) error {
-	// Reset engine state at the start of every request to prevent cross-test contamination
+func (g *GolEngine) updateHub() *UpdateHub {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.updates == nil {
+		g.updates = NewUpdateHub()
+	}
+	return g.updates
+}
+
+func (g *GolEngine) StartUpdates(req StartUpdatesRequest, res *StartUpdatesResponse) error {
+	if err := g.updateHub().Start(req.RunID); err != nil {
+		return err
+	}
 	g.mu.Lock()
 	g.paused = false
 	g.shutdown = false
 	g.currentTurn = 0
 	g.currentAlive = nil
 	g.mu.Unlock()
+	return nil
+}
+
+func (g *GolEngine) NextUpdate(req NextUpdateRequest, res *NextUpdateResponse) error {
+	update, done, err := g.updateHub().Next(req.RunID)
+	if err != nil {
+		return err
+	}
+	res.Update = update
+	res.Done = done
+	return nil
+}
+
+func (g *GolEngine) StopUpdates(req StopUpdatesRequest, res *StopUpdatesResponse) error {
+	g.updateHub().Stop(req.RunID)
+	return nil
+}
+
+func (g *GolEngine) ProcessTurns(req Request, res *Response) error {
+	hub := g.updateHub()
+	defer hub.Complete(req.RunID)
 
 	world := req.Board
 	p := req.Params
@@ -75,6 +228,7 @@ func (g *GolEngine) ProcessTurns(req Request, res *Response) error {
 			newWorld[i] = make([]byte, p.ImageWidth)
 		}
 
+		var flipped []util.Cell
 		for y := 0; y < p.ImageHeight; y++ {
 			for x := 0; x < p.ImageWidth; x++ {
 				neighbors := 0
@@ -91,18 +245,17 @@ func (g *GolEngine) ProcessTurns(req Request, res *Response) error {
 					}
 				}
 
+				next := byte(0)
 				if world[y][x] == 255 {
 					if neighbors == 2 || neighbors == 3 {
-						newWorld[y][x] = 255
-					} else {
-						newWorld[y][x] = 0
+						next = 255
 					}
-				} else {
-					if neighbors == 3 {
-						newWorld[y][x] = 255
-					} else {
-						newWorld[y][x] = 0
-					}
+				} else if neighbors == 3 {
+					next = 255
+				}
+				newWorld[y][x] = next
+				if world[y][x] != next {
+					flipped = append(flipped, util.Cell{X: x, Y: y})
 				}
 			}
 		}
@@ -121,6 +274,13 @@ func (g *GolEngine) ProcessTurns(req Request, res *Response) error {
 		g.currentTurn = turn + 1
 		g.currentAlive = alive
 		g.mu.Unlock()
+
+		if err := hub.Publish(req.RunID, TurnUpdate{
+			CompletedTurns: turn + 1,
+			Flipped:        flipped,
+		}); err != nil {
+			return err
+		}
 	}
 
 	var finalAlive []util.Cell
@@ -199,8 +359,14 @@ type Params struct {
 	ImageHeight int
 }
 
+func brokerAddress() string {
+	return os.Getenv("GOL_BROKER_ADDR")
+}
+
 func Run(p Params, events chan<- Event, keyPresses <-chan rune) {
-	startEmbeddedServer()
+	if brokerAddress() == "" {
+		startEmbeddedServer()
+	}
 
 	ioCommand := make(chan ioCommand)
 	ioIdle := make(chan bool)

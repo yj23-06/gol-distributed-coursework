@@ -22,6 +22,7 @@ type WorkerRequest struct {
 type WorkerResponse struct {
 	UpdatedRows [][]byte
 	Alive       []util.Cell
+	Flipped     []util.Cell
 }
 
 type WorkerEngine struct{}
@@ -52,6 +53,7 @@ func (w *WorkerEngine) ComputeGeneration(req WorkerRequest, res *WorkerResponse)
 	}
 
 	var alive []util.Cell
+	var flipped []util.Cell
 
 	// Compute Game of Life rules for each cell in the local strip
 	// Note: y in req.Rows corresponds to expanded index y + 1
@@ -93,11 +95,15 @@ func (w *WorkerEngine) ComputeGeneration(req WorkerRequest, res *WorkerResponse)
 					newRows[y][x] = 0
 				}
 			}
+			if expanded[expY][x] != newRows[y][x] {
+				flipped = append(flipped, util.Cell{X: x, Y: req.GlobalOffsetY + y})
+			}
 		}
 	}
 
 	res.UpdatedRows = newRows
 	res.Alive = alive
+	res.Flipped = flipped
 	return nil
 }
 
