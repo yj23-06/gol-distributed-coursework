@@ -11,11 +11,11 @@ import (
 
 // WorkerRequest carries a horizontal strip and its adjacent ghost rows from the broker
 type WorkerRequest struct {
-	Rows          [][]byte // The local horizontal rows assigned to this worker
-	TopGhost      []byte   // The bottom row of the worker above (or wrapped)
-	BottomGhost   []byte   // The top row of the worker below (or wrapped)
-	ImageWidth    int      // Total width of the global board
-	GlobalOffsetY int      // The starting Y index of this strip in the global grid
+	Rows          [][]byte
+	TopGhost      []byte
+	BottomGhost   []byte
+	ImageWidth    int
+	GlobalOffsetY int
 }
 
 // WorkerResponse returns the updated local rows and the alive cells found in this strip
@@ -32,11 +32,8 @@ func (w *WorkerEngine) ComputeGeneration(req WorkerRequest, res *WorkerResponse)
 	localHeight := len(req.Rows)
 	width := req.ImageWidth
 
-	// Construct an expanded working grid that includes the top and bottom ghost rows
-	// Expanded grid layout:
-	// Index 0: TopGhost
-	// Indices 1 to localHeight: req.Rows
-	// Index localHeight + 1: BottomGhost
+	// Add the ghost rows to either side of our section so that we can check neighbours across worker boundaries without needing extra requests.
+	// The actual rows sit between the two ghost rows.
 	expandedHeight := localHeight + 2
 	expanded := make([][]byte, expandedHeight)
 
@@ -55,8 +52,8 @@ func (w *WorkerEngine) ComputeGeneration(req WorkerRequest, res *WorkerResponse)
 	var alive []util.Cell
 	var flipped []util.Cell
 
-	// Compute Game of Life rules for each cell in the local strip
-	// Note: y in req.Rows corresponds to expanded index y + 1
+	// Only process the rows assigned to this worker.
+	// The extra rows are just there to help with neighbour calculations.
 	for y := 0; y < localHeight; y++ {
 		expY := y + 1
 		for x := 0; x < width; x++ {
@@ -78,7 +75,7 @@ func (w *WorkerEngine) ComputeGeneration(req WorkerRequest, res *WorkerResponse)
 				}
 			}
 
-			// Standard Game of Life rules
+			// Apply the standard Game of Life rules to decide whether this cell survives, dies or becomes alive.
 			isAlive := expanded[expY][x] == 255
 			if isAlive {
 				if neighbors == 2 || neighbors == 3 {
@@ -95,12 +92,16 @@ func (w *WorkerEngine) ComputeGeneration(req WorkerRequest, res *WorkerResponse)
 					newRows[y][x] = 0
 				}
 			}
+
+			// Keep track of cells whose state changed during this generation.
+			// Add the global Y coordinate because this worker only has a local section.
 			if expanded[expY][x] != newRows[y][x] {
 				flipped = append(flipped, util.Cell{X: x, Y: req.GlobalOffsetY + y})
 			}
 		}
 	}
 
+	// Send the results back to the broker once this worker has finished.
 	res.UpdatedRows = newRows
 	res.Alive = alive
 	res.Flipped = flipped
@@ -130,6 +131,8 @@ func main() {
 			log.Printf("Connection accept error: %v", err)
 			continue
 		}
+		// Handle each incoming connection separately so that the worker can deal with multiple RPC connections without blocking the listener.
+
 		go rpc.ServeConn(conn)
 	}
 }

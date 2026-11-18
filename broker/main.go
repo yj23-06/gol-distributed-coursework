@@ -12,7 +12,7 @@ import (
 	"uk.ac.bris.cs/gameoflife/util"
 )
 
-// WorkerRequest and WorkerResponse mirror the definitions on the AWS worker nodes
+// Stores the information sent to an AWS worker to process part of the board.
 type WorkerRequest struct {
 	Rows          [][]byte
 	TopGhost      []byte
@@ -21,12 +21,14 @@ type WorkerRequest struct {
 	GlobalOffsetY int
 }
 
+// Contains the updated rows and cell information returned by a worker.
 type WorkerResponse struct {
 	UpdatedRows [][]byte
 	Alive       []util.Cell
 	Flipped     []util.Cell
 }
 
+// Manages the AWS workers and keeps track of the overall simulation.
 type BrokerServer struct {
 	mu           sync.Mutex
 	workerAddrs  []string
@@ -38,6 +40,7 @@ type BrokerServer struct {
 	updatesMu    sync.Mutex
 }
 
+// Returns the update hub, creating one if it does not already exist.
 func (b *BrokerServer) updateHub() *gol.UpdateHub {
 	b.updatesMu.Lock()
 	defer b.updatesMu.Unlock()
@@ -47,10 +50,12 @@ func (b *BrokerServer) updateHub() *gol.UpdateHub {
 	return b.updates
 }
 
+// Starts a new update stream and resets the broker's simulation status.
 func (b *BrokerServer) StartUpdates(req gol.StartUpdatesRequest, res *gol.StartUpdatesResponse) error {
 	if err := b.updateHub().Start(req.RunID); err != nil {
 		return err
 	}
+	// Reset the simulation state before starting.
 	b.mu.Lock()
 	b.paused = false
 	b.shutdown = false
@@ -60,6 +65,7 @@ func (b *BrokerServer) StartUpdates(req gol.StartUpdatesRequest, res *gol.StartU
 	return nil
 }
 
+// Waits for the next update and returns it to the client.
 func (b *BrokerServer) NextUpdate(req gol.NextUpdateRequest, res *gol.NextUpdateResponse) error {
 	update, done, err := b.updateHub().Next(req.RunID)
 	if err != nil {
@@ -70,14 +76,13 @@ func (b *BrokerServer) NextUpdate(req gol.NextUpdateRequest, res *gol.NextUpdate
 	return nil
 }
 
+// Stops the update stream when the client no longer needs it
 func (b *BrokerServer) StopUpdates(req gol.StopUpdatesRequest, res *gol.StopUpdatesResponse) error {
 	b.updateHub().Stop(req.RunID)
 	return nil
 }
 
-// ProcessTurns receives the full board from the local controller, slices it,
-// coordinates turns across AWS workers, handles broker-mediated ghost-row exchange,
-// and returns the final alive cells.
+// ProcessTurns receives the full board from the local controller, slices it, coordinates turns across AWS workers, handles broker-mediated ghost-row exchange, and returns the final alive cells.
 func (b *BrokerServer) ProcessTurns(req gol.Request, res *gol.Response) error {
 	hub := b.updateHub()
 	defer hub.Complete(req.RunID)
@@ -127,7 +132,7 @@ func (b *BrokerServer) ProcessTurns(req gol.Request, res *gol.Response) error {
 					stripRows[r] = board[startY+r]
 				}
 
-				// Determine adjacent ghost rows with toroidal wrapping
+				// Determine adjacent ghost rows with wrapping
 				aboveWorker := (workerIdx - 1 + numWorkers) % numWorkers
 				belowWorker := (workerIdx + 1) % numWorkers
 
@@ -208,6 +213,7 @@ func (b *BrokerServer) ProcessTurns(req gol.Request, res *gol.Response) error {
 	return nil
 }
 
+// Returns the current turn and live cells to the client.
 func (b *BrokerServer) GetStatus(req gol.StatusRequest, res *gol.StatusResponse) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -216,6 +222,7 @@ func (b *BrokerServer) GetStatus(req gol.StatusRequest, res *gol.StatusResponse)
 	return nil
 }
 
+// Pauses the simulation by setting the paused flag.
 func (b *BrokerServer) Pause(req gol.PauseRequest, res *gol.PauseResponse) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -223,6 +230,7 @@ func (b *BrokerServer) Pause(req gol.PauseRequest, res *gol.PauseResponse) error
 	return nil
 }
 
+// Resumes the simulation by clearing the paused flag.
 func (b *BrokerServer) Resume(req gol.ResumeRequest, res *gol.ResumeResponse) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -230,6 +238,7 @@ func (b *BrokerServer) Resume(req gol.ResumeRequest, res *gol.ResumeResponse) er
 	return nil
 }
 
+// Requests the broker to stop the simulation.
 func (b *BrokerServer) Shutdown(req gol.ShutdownRequest, res *gol.ShutdownResponse) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -239,15 +248,15 @@ func (b *BrokerServer) Shutdown(req gol.ShutdownRequest, res *gol.ShutdownRespon
 }
 
 func main() {
+	// Read the broker port from the command line, using 8030 by default.
 	port := flag.String("port", "8030", "Broker port")
 	flag.Parse()
 
-	// Configure your AWS EC2 instance IP addresses here
+	// Configure AWS EC2 instance IP addresses
 	broker := &BrokerServer{
 		workerAddrs: []string{
 			"3.89.189.62:8030",
 			"100.53.212.156:8030",
-			// Replace / add your AWS worker node IPs here
 		},
 	}
 
