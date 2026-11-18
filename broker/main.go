@@ -245,8 +245,8 @@ func main() {
 	// Configure your AWS EC2 instance IP addresses here
 	broker := &BrokerServer{
 		workerAddrs: []string{
-			"54.156.62.118:8030",
-			"23.23.46.79:8030",
+			"3.89.189.62:8030",
+			"100.53.212.156:8030",
 			// Replace / add your AWS worker node IPs here
 		},
 	}
